@@ -82,37 +82,29 @@ def pact_quantize_asymm_inference(W, eps, alpha, beta, train_loop=True, train_lo
         W_quant = W.clone().detach() + eps/2
     else:
         W_quant = W.clone().detach()
+    if len(W.shape) == 4:
+        alpha = alpha.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        beta = beta.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        eps = eps.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+    elif len(W.shape) == 3:
+        alpha = alpha.unsqueeze(1).unsqueeze(2)
+        beta = beta.unsqueeze(1).unsqueeze(2)
+        eps = eps.unsqueeze(1).unsqueeze(2)
+    else:
+        alpha = alpha.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+        eps = eps.unsqueeze(1)
+    alpha = alpha.expand((-1, *W.shape[1:]))
+    beta = beta.expand((-1, *W.shape[1:]))
+    eps = eps.expand((-1, *W.shape[1:]))
     W_quant.data[:] = (W_quant.data[:] / eps).floor()*eps
-    W_quant.clamp_(-alpha.item(), beta.item() + eps.item())
-    return W_quant
-
-def pact_pwl(x, eps, alpha, beta, q0=0):
-    beta = beta.abs()
-    beta_cumsum = beta.cumsum(0)
-    m = eps / beta # at initial PWL step, should be 1!
-    # compute step, extended with -alpha at the beginning
-    step = torch.cat((torch.as_tensor((-np.infty,), device=alpha.device), -alpha, -alpha + beta_cumsum[:-1], torch.as_tensor((+np.infty,), device=alpha.device)))
-    sr = torch.arange(len(step.shape)+len(x.shape))
-    sr_m1  = sr[-1].clone().detach()
-    sr[1:] = sr[:-1].clone().detach()
-    sr[0]  = sr_m1
-    step = step.repeat((*x.shape,1)).permute(tuple(sr.numpy()))
-    # compute q offset
-    q = torch.zeros_like(beta)
-    q[1:] = q0 + eps * (torch.arange(1, beta.shape[0], dtype=torch.float32, device=alpha.device) - 1 - (-alpha + beta_cumsum[:-1])/beta[1:])
-    # extend m with a final 0
-    m = torch.cat((torch.ones(1, device=alpha.device), m))
-    q = torch.cat((torch.zeros(1, device=alpha.device), q))
-    y = torch.zeros_like(x)
-    # compare
-    inside = ((x >= step[:-1]) * (x < step[1:]))
-    for i in range(len(inside.shape)-1):
-        m = torch.unsqueeze(m, -1)
-        q = torch.unsqueeze(q, -1)
-    x = torch.unsqueeze(x, 0)
-    y = torch.where(inside, m*x+q, y).sum(0)
-    del inside, m, q, beta_cumsum
-    return y.clamp(-alpha.item(), alpha.item()-eps.item())
+    # W_quant.clamp_(-alpha.item(), beta.item() + eps.item())
+    where_nonclipped = (W >= -alpha) * (W < beta)
+    where_ltalpha = (W < -alpha)
+    where_gtbeta = (W >= beta + eps) # FIXME possible numerical difference, see clamp above!!!
+    Wq1 = torch.where(where_ltalpha, torch.zeros_like(alpha), W_quant)
+    Wq2 = torch.where(where_gtbeta, beta, Wq1)
+    return Wq2
 
 # PACT activation: https://arxiv.org/pdf/1805.06085.pdf
 class PACT_QuantFunc(torch.autograd.Function):
@@ -152,10 +144,18 @@ class PACT_QuantFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, eps, alpha, delta=1e-9):
+        alpha = alpha.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+        alpha = alpha.expand((input.shape[0], -1, *input.shape[2:]))
+        eps = eps.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+        eps = eps.expand((input.shape[0], -1, *input.shape[2:]))
+        zeros = torch.zeros_like(alpha)
         where_input_nonclipped = (input >= 0) * (input < alpha)
         where_input_gtalpha = (input >= alpha)
+        where_input_gtzero  = (input >= 0)
         ctx.save_for_backward(where_input_nonclipped, where_input_gtalpha)
-        return (input.clamp(0., alpha.data[0]) / (eps+delta)).floor() * eps
+        y  = torch.where(where_input_gtzero,  (input / (eps+delta)).floor() * eps, zeros)
+        yy = torch.where(where_input_gtalpha, alpha, y)
+        return yy
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -163,7 +163,7 @@ class PACT_QuantFunc(torch.autograd.Function):
         where_input_nonclipped, where_input_gtalpha = ctx.saved_variables
         zero = torch.zeros(1).to(where_input_nonclipped.device)
         grad_input = torch.where(where_input_nonclipped, grad_output, zero)
-        grad_alpha = torch.where(where_input_gtalpha, grad_output, zero).sum().expand(1)
+        grad_alpha = torch.where(where_input_gtalpha, grad_output, zero).sum((0,2,3))
         return grad_input, None, grad_alpha
 
 pact_quantize = PACT_QuantFunc.apply
@@ -262,11 +262,29 @@ class PACT_QuantFunc_Asymm(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, eps, alpha, beta, delta=1e-9):
+        if len(input.shape) == 4:
+            alpha = alpha.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+            beta = beta.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+            eps = eps.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        elif len(input.shape) == 3:
+            alpha = alpha.unsqueeze(1).unsqueeze(2)
+            beta = beta.unsqueeze(1).unsqueeze(2)
+            eps = eps.unsqueeze(1).unsqueeze(2)
+        else:
+            alpha = alpha.unsqueeze(1)
+            beta = beta.unsqueeze(1)
+            eps = eps.unsqueeze(1)
+        alpha = alpha.expand((-1, *input.shape[1:]))
+        beta = beta.expand((-1, *input.shape[1:]))
+        eps = eps.expand((-1, *input.shape[1:]))
+        zeros = torch.zeros_like(alpha)
         where_input_nonclipped = (input >= -alpha) * (input < beta)
         where_input_ltalpha = (input < -alpha)
         where_input_gtbeta = (input >= beta)
         ctx.save_for_backward(where_input_nonclipped, where_input_ltalpha, where_input_gtbeta)
-        return (input.clamp(-alpha.data[0], beta.data[0]) / (eps+delta)).floor() * eps
+        y  = torch.where(where_input_ltalpha, zeros, (input / (eps+delta)).floor() * eps)
+        yy = torch.where(where_input_gtbeta, beta, y)
+        return yy
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -274,8 +292,15 @@ class PACT_QuantFunc_Asymm(torch.autograd.Function):
         where_input_nonclipped, where_input_ltalpha, where_input_gtbeta = ctx.saved_variables
         zero = torch.zeros(1).to(where_input_nonclipped.device)
         grad_input = torch.where(where_input_nonclipped, grad_output, zero)
-        grad_alpha = torch.where(where_input_ltalpha, grad_output, zero).sum().expand(1)
-        grad_beta = torch.where(where_input_gtbeta, grad_output, zero).sum().expand(1)
+        if len(grad_input.shape) == 4:
+            dims = (1,2,3)
+        elif len(grad_input.shape) == 3:
+            dims = (1,2)
+        else:
+            dims = (1,)
+        # FIXME something is wrong here!!!
+        grad_alpha = torch.where(where_input_ltalpha, grad_output, zero).sum(dims)
+        grad_beta = torch.where(where_input_gtbeta, grad_output, zero).sum(dims)
         return grad_input, None, grad_alpha, grad_beta
 
 pact_quantize_asymm = PACT_QuantFunc_Asymm.apply
@@ -296,7 +321,7 @@ class PACT_Act(torch.nn.Module):
 
     """
 
-    def __init__(self, precision=None, alpha=1., backprop_alpha=True, statistics_only=False, leaky=None):
+    def __init__(self, precision=None, alpha=1., backprop_alpha=True, statistics_only=False, leaky=None, per_channel=False):
         r"""Constructor. Initializes a :py:class:`torch.nn.Parameter` for :math:`\alpha` and sets
             up the initial value of the `statistics_only` member.
 
@@ -316,19 +341,19 @@ class PACT_Act(torch.nn.Module):
             self.precision = Precision()
         else:
             self.precision = precision
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.alpha = torch.nn.Parameter(torch.Tensor((alpha,)).to(device), requires_grad=backprop_alpha)
-        self.alpha_p = alpha
         self.statistics_only = statistics_only
         self.deployment = False
         self.eps_in = None
         self.leaky = leaky
+        self.per_channel = per_channel
+        self.backprop_alpha = backprop_alpha
 
-        # these are only used to gather statistics
-        self.max          = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
-        self.min          = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
-        self.running_mean = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
-        self.running_var  = torch.nn.Parameter(torch.ones_like(self.alpha.data).to(device),  requires_grad=False)
+        # do not allocate these at the beginning, but require statistics collection!
+        self.alpha = alpha
+        self.max = None
+        self.min = None
+        self.running_mean = None
+        self.running_var = None
 
     def set_static_precision(self):
         r"""Sets static parameters used only for deployment.
@@ -361,10 +386,16 @@ class PACT_Act(torch.nn.Module):
 
         """
 
-        if use_max:
-            self.alpha.data[0] = self.max.item()
+        if self.per_channel:
+            if use_max:
+                self.alpha.data[:] = self.max[:]
+            else:
+                self.alpha.data[:] = nb_std * torch.sqrt(self.var[:])
         else:
-            self.alpha.data[0] = nb_std * torch.sqrt(self.var).item()
+            if use_max:
+                self.alpha.data[0] = self.max.item()
+            else:
+                self.alpha.data[0] = nb_std * torch.sqrt(self.var).item()
 
     def get_statistics(self):
         r"""Returns the statistics collected up to now.
@@ -373,7 +404,10 @@ class PACT_Act(torch.nn.Module):
         :rtype:  tuple of floats
 
         """
-        return self.max.item(), self.running_mean.item(), self.running_var.item()
+        if self.per_channel:
+            return self.max, self.running_mean, self.running_var
+        else:
+            return self.max.item(), self.running_mean.item(), self.running_var.item()
     
     def forward(self, x):
         r"""Forward-prop function for PACT-quantized activations.
@@ -392,15 +426,34 @@ class PACT_Act(torch.nn.Module):
         if self.deployment:
             return pact_quantize_deploy(x, self.eps_static, self.alpha_static)
         elif self.statistics_only:
+            # lazily allocate parameters
+            if self.max is None:
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                if self.per_channel:
+                    nb_channels = x.shape[1]
+                    self.alpha = self.alpha * torch.nn.Parameter(torch.ones(nb_channels).to(device), requires_grad=self.backprop_alpha)
+                else:
+                    self.alpha = torch.nn.Parameter(torch.Tensor((self.alpha,)).to(device), requires_grad=self.backprop_alpha)
+                self.max          = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
+                self.min          = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
+                self.running_mean = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
+                self.running_var  = torch.nn.Parameter(torch.ones_like(self.alpha.data).to(device),  requires_grad=False)
             if self.leaky is None:
                 x = torch.nn.functional.relu(x)
             else:
                 x = torch.nn.functional.leaky_relu(x, self.leaky)
-            with torch.no_grad():
-                self.max[:] = max(self.max.item(), x.max())
-                self.min[:] = min(self.min.item(), x.min())
-                self.running_mean[:] = 0.9 * self.running_mean.item() + 0.1 * x.mean()
-                self.running_var[:]  = 0.9 * self.running_var.item()  + 0.1 * x.std()*x.std()
+            if self.per_channel:
+                with torch.no_grad():
+                    self.max[:] = torch.max(self.max, x.detach().max(0).values.max(1).values.max(1).values)
+                    self.min[:] = torch.min(self.min, x.detach().min(0).values.min(1).values.min(1).values)
+                    self.running_mean[:] = 0.9 * self.running_mean + 0.1 * x.mean((0,2,3))
+                    self.running_var[:]  = 0.9 * self.running_var  + 0.1 * x.std((0,2,3))*x.std((0,2,3))
+            else:
+                with torch.no_grad():
+                    self.max[:] = max(self.max.item(), x.max())
+                    self.min[:] = min(self.min.item(), x.min())
+                    self.running_mean[:] = 0.9 * self.running_mean.item() + 0.1 * x.mean()
+                    self.running_var[:]  = 0.9 * self.running_var.item()  + 0.1 * x.std()*x.std()
             return x
         else:
             return pact_quantize(x, self.alpha/(2.0**(self.precision.get_bits())-1), self.alpha)
@@ -907,6 +960,7 @@ class PACT_Conv2d(torch.nn.Conv2d):
         x_precision=None,
         alpha=1.,
         quant_asymm=True,
+        per_channel=False,
         **kwargs
     ):
         r"""Constructor. Supports all arguments supported by :py:class:`torch.nn.Conv2d` plus additional ones.
@@ -938,14 +992,22 @@ class PACT_Conv2d(torch.nn.Conv2d):
 
         super(PACT_Conv2d, self).__init__(in_channels, out_channels, kernel_size, **kwargs)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.W_alpha = torch.nn.Parameter(torch.Tensor((alpha,)).to(device))
-        if quant_asymm:
-            self.W_beta  = torch.nn.Parameter(torch.Tensor((alpha,)).to(device))
+        self.alpha = alpha
+
+        if per_channel:
+            self.W_alpha = alpha * torch.nn.Parameter(torch.ones(out_channels).to(device))
+            if quant_asymm:
+                self.W_beta  = alpha * torch.nn.Parameter(torch.ones(out_channels).to(device))
+        else:
+            self.W_alpha = torch.nn.Parameter(torch.Tensor((alpha,)).to(device))
+            if quant_asymm:
+                self.W_beta  = torch.nn.Parameter(torch.Tensor((alpha,)).to(device))
 
         self.x_alpha = torch.nn.Parameter(torch.Tensor((2.0,)).to(device))
         self.weight.data.uniform_(-1., 1.)
 
         self.quant_asymm = quant_asymm
+        self.per_channel = per_channel
 
         self.train_loop = True
         self.deployment = False
@@ -953,23 +1015,29 @@ class PACT_Conv2d(torch.nn.Conv2d):
 
         self.padding_value = 0
 
-    def reset_alpha_weights(self, use_max=True, nb_std=5., verbose=False, **kwargs):
+    def reset_alpha_weights(self, use_max=True, nb_std=5., **kwargs):
         r"""Resets :math:`\alpha` and :math:`\beta` parameters for weights.
 
         """
 
-        if not self.quant_asymm:
-            self.W_alpha.data[0] = self.weight.data.abs().max()
-        elif use_max:
-            self.W_alpha.data[0] = -self.weight.data.min()
-            self.W_beta.data [0] =  self.weight.data.max()
+        if self.per_channel:
+            if not self.quant_asymm:
+                self.W_alpha =  self.weight.data.abs().max(0).values
+            elif use_max:
+                self.W_alpha = -self.weight.data.min(1).values.min(1).values.min(1).values
+                self.W_beta  =  self.weight.data.max(1).values.max(1).values.max(1).values
+            else:
+                self.W_alpha = -self.weight.data.mean((1,2,3)) + nb_std*self.weight.data.std((1,2,3))
+                self.W_beta  =  self.weight.data.mean((1,2,3)) + nb_std*self.weight.data.std((1,2,3))
         else:
-            self.W_alpha.data[0] = -self.weight.data.mean() + nb_std*self.weight.data.std()
-            self.W_beta.data[0]  =  self.weight.data.mean() + nb_std*self.weight.data.std()
-        if verbose:
-            logging.info("[Quant] W_alpha = %.5f" % self.W_alpha.data[0])
-            logging.info("[Quant] W_beta  = %.5f" % self.W_beta.data[0])
-
+            if not self.quant_asymm:
+                self.W_alpha.data[0] = self.weight.data.abs().max()
+            elif use_max:
+                self.W_alpha.data[0] = -self.weight.data.min()
+                self.W_beta.data [0] =  self.weight.data.max()
+            else:
+                self.W_alpha.data[0] = -self.weight.data.mean() + nb_std*self.weight.data.std()
+                self.W_beta.data[0]  =  self.weight.data.mean() + nb_std*self.weight.data.std()
     def harden_weights(self):
         r"""Replaces the current value of weight tensors (full-precision, quantized on forward-prop) with the quantized value.
 
@@ -1028,6 +1096,7 @@ class PACT_Conv2d(torch.nn.Conv2d):
         else:
             eps_W = 2*self.W_alpha/(2.0**(self.W_precision.get_bits())-1)
         return eps_W * eps_in
+
     def forward(self, input):
         r"""Forward-prop function for PACT-quantized 2d-convolution.
 
@@ -1061,15 +1130,18 @@ class PACT_Conv2d(torch.nn.Conv2d):
             else:
                 pad = self.padding
             x_quant = torch.nn.functional.pad(x_quant, pad, 'constant', self.padding_value)
-        y = torch.nn.functional.conv2d(
-            x_quant,
-            W_quant,
-            self.bias, # typically nil
-            self.stride,
-            self.padding if not self.deployment or self.bias is None else 0,
-            self.dilation,
-            self.groups
-        )
+        try:
+            y = torch.nn.functional.conv2d(
+                x_quant,
+                W_quant,
+                self.bias, # typically nil
+                self.stride,
+                self.padding if not self.deployment or self.bias is None else 0,
+                self.dilation,
+                self.groups
+            )
+        except RuntimeError:
+            import IPython; IPython.embed()
         if not self.training and self.quantize_W:
             del W_quant
         # y is returned non-quantized, as it is assumed to be quantized after BN
