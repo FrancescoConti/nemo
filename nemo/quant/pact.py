@@ -37,6 +37,34 @@ QD_REQUANT_DEBUG = False
 
 __all__ = ["PACT_Conv1d", "PACT_Conv2d", "PACT_Linear", "PACT_Act", "PACT_ThresholdAct", "PACT_IntegerAct", "PACT_IntegerAvgPool2d", "PACT_Identity", "PACT_QuantizedBatchNormNd", "PACT_IntegerBatchNormNd"]
 
+class AdaRound_h(torch.autograd.Function):
+ 
+    @staticmethod
+    def forward(ctx, input, th=0.5, gamma=-0.1, zeta=1.1):
+        output = torch.clamp(torch.sigmoid(input) * (zeta-gamma) + gamma, 0, 1)
+        one = torch.ones(1).to(input.device)
+        ctx.save_for_backward(input, one*th, one*gamma, one*zeta)
+        output[output < th] = 0
+        output[output >= th] = 1
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, th, gamma, zeta = ctx.saved_variables
+        return (zeta-gamma) * torch.exp(-input) / torch.square(torch.exp(-input) + 1) * grad_output
+
+adaround_h = AdaRound_h.apply
+
+def adaround_h_hard(x, gamma=-0.1, zeta=1.1):
+    hx = torch.clamp(torch.sigmoid(x) * (zeta-gamma) + gamma, 0, 1)
+    ret = torch.zeros_like(hx)
+    ret[hx <  0.5] = 0
+    ret[hx >= 0.5] = 1
+    return ret
+
+# def adaround_h(x, gamma=-0.1, zeta=1.1):
+#     return torch.clamp(torch.sigmoid(x) * (zeta-gamma) + gamma, 0, 1)
+
 # re-quantize from a lower precision (larger eps_in) to a higher precision (lower eps_out)
 # requantization rounding can be excluded for debug purposes, e.g., to identify numerical
 # differences that are hidden by the requantization approximation
@@ -83,16 +111,16 @@ def pact_quantize_signed_inference(W, eps, clip):
     return pact_quantize_asymm_inference(W, torch.as_tensor(eps), torch.as_tensor(clip), torch.as_tensor(clip))
 
 # PACT asymmetric quantization for inference (workaround for pact_quantize_asymm not functional in inference)
-def pact_quantize_asymm_inference(W, eps, alpha, beta, train_loop=True, train_loop_oldprec=None):
+def pact_quantize_asymm_inference(W, eps, alpha, beta, offset=0.5, train_loop=True, train_loop_oldprec=None):
     # for numerical reasons, W_quant should be put at a "small_eps" of its "pure" value to enable
     # running againt the weights through pact_quantize_asymm_inference (the torch.floor function
     # won't return the correct value otherwise)
     # we choose small_eps = eps/2
     if not train_loop and train_loop_oldprec is not None:
         W_quant = W.clone().detach()
-        W_quant.data[:] = (W_quant.data[:] / train_loop_oldprec).floor()*train_loop_oldprec + eps*0.5
+        W_quant.data[:] = (W_quant.data[:] / train_loop_oldprec).floor()*train_loop_oldprec + offset*eps
     else:
-        W_quant = W.clone().detach() + eps*0.5
+        W_quant = W.clone().detach() + offset*eps
     W_quant.data[:] = (W_quant.data[:] / eps).floor()*eps
     # alpha, beta are also represented with quantized numbers
     alpha = torch.ceil(alpha/eps)*eps
@@ -238,6 +266,72 @@ class PACT_QuantFunc_Signed(torch.autograd.Function):
 
 # DEPRECATED
 pact_quantize_signed = PACT_QuantFunc_Signed.apply
+
+class PACT_QuantFunc_AsymmFloor(torch.autograd.Function):
+    r"""PACT (PArametrized Clipping acTivation) quantization function (asymmetric).
+
+        Implements a :py:class:`torch.autograd.Function` for quantizing weights in :math:`Q` bits using an asymmetric PACT-like strategy (original
+        PACT is applied only to activations, using DoReFa-style weights).
+        In forward propagation, the function is defined as 
+        
+        .. math::
+            \mathbf{y} = f(\mathbf{x}) = 1/\varepsilon \cdot \left\lfloor\mathrm{clip}_{ [-\alpha,+\beta) } (\mathbf{x})\right\rfloor \cdot \varepsilon
+        
+        where :math:`\varepsilon` is the quantization precision:
+        
+        .. math::
+            \varepsilon = (\alpha+\beta) / (2^Q - 1)
+        
+        In backward propagation, using the Straight-Through Estimator, the gradient of the function is defined as
+        
+        .. math::
+            \mathbf{\nabla}_\mathbf{x} \mathcal{L} &\doteq \mathbf{\nabla}_\mathbf{y} \mathcal{L}
+        
+        It can be applied by using its static `.apply` method:
+    
+    :param input: the tensor containing :math:`x`, the weights to be quantized.
+    :type  input: `torch.Tensor`
+    :param eps: the precomputed value of :math:`\varepsilon`.
+    :type  eps: `torch.Tensor` or float
+    :param alpha: the value of :math:`\alpha`.
+    :type  alpha: `torch.Tensor` or float
+    :param beta: the value of :math:`\beta`.
+    :type  beta: `torch.Tensor` or float
+    :param delta: constant to sum to `eps` for numerical stability (default unused, 0).
+    :type  delta: `torch.Tensor` or float
+    
+    :return: The quantized weights tensor.
+    :rtype:  `torch.Tensor`
+
+    """
+
+    @staticmethod
+    def forward(ctx, input, offset, eps, alpha, beta, delta=0):
+        # we quantize also alpha, beta. for beta it's "cosmetic", for alpha it is 
+        # substantial, because also alpha will be represented as a wholly integer number
+        # down the line
+        alpha_quant = (alpha.item() / (eps+delta)).ceil()  * eps
+        beta_quant  = (beta.item()  / (eps+delta)).floor() * eps
+        where_input_nonclipped = (input >= -alpha_quant) * (input < beta_quant)
+        where_input_ltalpha = (input < -alpha_quant)
+        where_input_gtbeta = (input >= beta_quant)
+        ctx.save_for_backward(where_input_nonclipped, where_input_ltalpha, where_input_gtbeta)
+        return ((input.clamp(-alpha_quant.item(), beta_quant.item()) / (eps+delta)).floor() + offset) * eps
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # see Hubara et al., Section 2.3
+        where_input_nonclipped, where_input_ltalpha, where_input_gtbeta = ctx.saved_variables
+        zero = torch.zeros(1).to(where_input_nonclipped.device)
+        grad_input = grad_output # torch.where(where_input_nonclipped, grad_output, zero)
+        grad_offset = grad_output
+        grad_alpha = torch.where(where_input_ltalpha, grad_output, zero).sum().expand(1)
+        grad_beta  = torch.where(where_input_gtbeta, grad_output, zero).sum().expand(1)
+        return grad_input, grad_offset, None, grad_alpha, grad_beta
+
+pact_quantize_asymm_floor = PACT_QuantFunc_AsymmFloor.apply
+
+
 
 class PACT_QuantFunc_Asymm(torch.autograd.Function):
     r"""PACT (PArametrized Clipping acTivation) quantization function (asymmetric).
@@ -1000,6 +1094,10 @@ class PACT_Conv2d(torch.nn.Conv2d):
         self.integerized = False
         self.eps_out_static = None
 
+        self.adaround = False
+        self.adaround_param = None
+        self.adaround_hardened = False
+
     def reset_alpha_weights(self, use_method='max', nb_std=5., verbose=False, dyn_range_bins=1024, dyn_range_cutoff=0., **kwargs):
         r"""Resets :math:`\alpha` and :math:`\beta` parameters for weights.
 
@@ -1126,13 +1224,22 @@ class PACT_Conv2d(torch.nn.Conv2d):
             x_quant = pact_quantize_signed(input, self.x_alpha/(2.0**(self.x_precision.get_bits())-1), self.x_alpha)
         else:
             x_quant = input
-        if self.training and self.quantize_W and not self.deployment:
+        if self.training and self.quantize_W and not self.deployment and self.adaround:
+            W_eps = (self.W_beta+self.W_alpha)/(2.0**(self.W_precision.get_bits())-1)
+            W_quant = pact_quantize_asymm_floor(self.weight, adaround_h(self.adaround_param), W_eps, self.W_alpha, self.W_beta) # was adaround_h_soft!
+        elif self.training and self.quantize_W and not self.deployment:
             if self.quant_asymm:
                 W_quant = pact_quantize_asymm(self.weight, (self.W_beta+self.W_alpha)/(2.0**(self.W_precision.get_bits())-1), self.W_alpha, self.W_beta)
             else:
                 W_quant = pact_quantize_signed(self.weight, 2*self.W_alpha/(2.0**(self.W_precision.get_bits())-1), self.W_alpha)
         elif self.quantize_W and not self.deployment:
-            if self.quant_asymm:
+            if self.adaround and not self.adaround_hardened:
+                eps = (self.W_beta+self.W_alpha)/(2.0**(self.W_precision.get_bits())-1)
+                W_quant = pact_quantize_asymm_inference(self.weight, eps, torch.ceil(self.W_alpha/eps)*eps, torch.floor(self.W_beta/eps)*eps, train_loop=self.train_loop, train_loop_oldprec=self.train_loop_oldprec, offset=adaround_h_hard(self.adaround_param))
+            elif self.adaround and self.adaround_hardened:
+                eps = (self.W_beta+self.W_alpha)/(2.0**(self.W_precision.get_bits())-1)
+                W_quant = pact_quantize_asymm_inference(self.weight, eps, torch.ceil(self.W_alpha/eps)*eps, torch.floor(self.W_beta/eps)*eps, train_loop=self.train_loop, train_loop_oldprec=self.train_loop_oldprec, offset=0.)
+            elif self.quant_asymm:
                 eps = (self.W_beta+self.W_alpha)/(2.0**(self.W_precision.get_bits())-1)
                 W_quant = pact_quantize_asymm_inference(self.weight, eps, torch.ceil(self.W_alpha/eps)*eps, torch.floor(self.W_beta/eps)*eps, train_loop=self.train_loop, train_loop_oldprec=self.train_loop_oldprec)
             else:

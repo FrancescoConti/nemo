@@ -41,6 +41,8 @@ from nemo.transf.pruning import *
 from nemo.transf.statistics import *
 from nemo.transf.utils import *
 from nemo.transf.sawb import *
+from nemo.transf.lapq import *
+from nemo.transf.adaround import *
 
 def quantize_pact(module, W_bits=4, x_bits=4, dummy_input=None, remove_dropout=False, **kwargs):
     r"""Takes a PyTorch module and makes it quantization-aware with PACT, recursively.
@@ -141,6 +143,10 @@ def quantize_pact(module, W_bits=4, x_bits=4, dummy_input=None, remove_dropout=F
     module.unset_statistics_bn         = types.MethodType(nemo.transf.statistics._unset_statistics_bn_pact, module)
     module.disable_grad_sawb           = types.MethodType(nemo.transf.sawb._disable_grad_sawb, module)
     module.weight_clip_sawb            = types.MethodType(nemo.transf.sawb._weight_clip_sawb, module)
+    module.weight_clip_lapq            = types.MethodType(nemo.transf.lapq._weight_clip_lapq, module)
+    module.weight_clip_lapq_sweep      = types.MethodType(nemo.transf.lapq._weight_clip_lapq_sweep, module)
+    module.adaround_train              = types.MethodType(nemo.transf.adaround._adaround_train, module)
+    module.adaround_harden             = types.MethodType(nemo.transf.adaround._adaround_harden, module)
     module.W_precision = Precision(W_bits, None)
     module.x_precision = Precision(x_bits, None)
     return module

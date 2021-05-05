@@ -33,13 +33,13 @@ from nemo.transf.common import *
 
 # first entry is c1, second is c2 with alpha_w^* = c1 * sqrt(Ew2) - c2 * Ew1
 __sawb_asymm_lut = {
-    2: [8.356, 7.841],
-    3: [4.643, 3.729],
-    4: [8.356, 7.841],
+    2: [2.006, 0.969],
+    3: [4.627, 3.720],
+    4: [8.451, 7.972],
     5: [12.522, 12.592],
     6: [15.344, 15.914],
     7: [19.767, 21.306],
-    8: [26.294, 29.421]
+    8: [29.928, 34.012]
 }
 
 # Disable gradients for alpha,beta params
