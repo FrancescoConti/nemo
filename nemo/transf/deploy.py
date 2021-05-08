@@ -82,9 +82,10 @@ def _set_deployment_pact(self, eps_in, only_activations=False, **kwargs):
             (not only_activations and m.__class__.__name__ == "PACT_Conv1d") or \
             (not only_activations and m.__class__.__name__ == "PACT_Linear") or \
             (not only_activations and m.__class__.__name__ == "PACT_IntegerAdd") or \
-                                      m.__class__.__name__ == "PACT_Act"):
+                                      m.__class__.__name__ == "PACT_Act" or \
+                                      m.__class__.__name__ == "PACT_ActAsymm"):
             m.deployment = True
-        if (m.__class__.__name__ == "PACT_Act"):
+        if (m.__class__.__name__ == "PACT_Act" or m.__class__.__name__ == "PACT_ActAsymm"):
             m.set_static_precision(**kwargs)
 
 def _set_eps_in_pact(self, eps_in):
@@ -100,12 +101,13 @@ def _set_eps_in_pact(self, eps_in):
     self.graph.rebuild_module_dict()
     for n,m in self.named_modules():
         if (m.__class__.__name__ == "PACT_Act" or \
+            m.__class__.__name__ == "PACT_ActAsymm" or \
             m.__class__.__name__ == "PACT_QuantizedBatchNormNd" or \
             m.__class__.__name__ == "PACT_IntegerAdd"):
             eps_in_new = self.get_eps_at(n, eps_in)
             if eps_in_new is None:
                 continue
-        if (m.__class__.__name__ == "PACT_Act"):
+        if (m.__class__.__name__ == "PACT_Act" or m.__class__.name__ == "PACT_ActAsymm"):
             m.eps_in = torch.tensor(eps_in_new[0], requires_grad=False)
         if (m.__class__.__name__ == "PACT_QuantizedBatchNormNd"):
             m.eps_in = torch.tensor(eps_in_new[0], requires_grad=False)
@@ -147,7 +149,7 @@ def _qd_stage(self, eps_in, add_input_bias_dict={}, remove_bias_dict={}, prune_e
         nemo.transform.bn_quantizer(self, **kwargs)
     else:  # this is mainly useful for debug purposes, to identify misalignments FQ/QD
         for n,m in self.named_modules():
-            if (m.__class__.__name__ == "PACT_Act"):
+            if (m.__class__.__name__ == "PACT_Act" or m.__class__.__name__ == "PACT_ActAsymm"):
                 m.precise = True
     self.set_deployment(eps_in=eps_in, **kwargs) # with initial BN eps
     if bn_calibration_fn is not None:

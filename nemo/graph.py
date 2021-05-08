@@ -273,6 +273,7 @@ class DeployGraph(object):
         actnodes = []
         for k,n in self.nodes.items():
             if isinstance(self.module_nodes[n.key], PACT_Act) or \
+               isinstance(self.module_nodes[n.key], PACT_ActAsymm) or \
                isinstance(self.module_nodes[n.key], PACT_ThresholdAct) or \
                isinstance(self.module_nodes[n.key], PACT_IntegerAct):
                 actnodes.append(n)
@@ -283,6 +284,7 @@ class DeployGraph(object):
             curr = target.incoming[0]
             route = []
             while not isinstance(self.module_nodes[curr.key], PACT_Act) or \
+                      isinstance(self.module_nodes[curr.key], PACT_ActAsymm) or \
                       isinstance(self.module_nodes[curr.key], PACT_ThresholdAct) or \
                       isinstance(self.module_nodes[curr.key], PACT_IntegerAct):
                 route.append((self.non_unique_names_dict[curr.key], self.module_nodes[curr.key]))

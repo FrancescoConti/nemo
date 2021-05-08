@@ -71,7 +71,8 @@ def _change_precision_pact(self, bits=4, scale_activations=True, scale_weights=T
                 min_prec_W.bits = min_prec_dict[n]['W_bits']
             except KeyError:
                 pass
-        if m.__class__.__name__ == "PACT_Act" and scale_activations:
+        if m.__class__.__name__ == "PACT_Act" or \
+           m.__class__.__name__ == "PACT_ActAsymm" and scale_activations:
             m.precision = max(self.x_precision, min_prec_x)
         if scale_weights and (m.__class__.__name__ == "PACT_Conv2d" or \
                               m.__class__.__name__ == "PACT_Conv1d" or \
@@ -79,7 +80,7 @@ def _change_precision_pact(self, bits=4, scale_activations=True, scale_weights=T
             m.W_precision = max(self.W_precision, min_prec_W)
             if reset_alpha:
                 m.reset_alpha_weights()
-        if verbose and (m.__class__.__name__ == "PACT_Act") and scale_activations:
+        if verbose and (m.__class__.__name__ == "PACT_Act" or m.__class__.__name__ == "PACT_ActAsymm") and scale_activations: 
             try:
                 logging.info("[Quant]\t\t %s: x_bits=%.2f" % (n, m.precision.get_bits()))
             except AttributeError:
@@ -121,7 +122,8 @@ def _reset_alpha_act_pact(self, **kwargs):
     """
 
     for n,m in self.named_modules():
-        if m.__class__.__name__ == "PACT_Act":
+        if m.__class__.__name__ == "PACT_Act" or \
+           m.__class__.__name__ == "PACT_ActAsymm":
             m.reset_alpha(**kwargs)
 
 def _get_nonclip_parameters_pact(self):

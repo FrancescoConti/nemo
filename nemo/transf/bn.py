@@ -97,6 +97,7 @@ def _calibrate_bn_pact(self, calib_dict={}, kappa_bit_default=14, lamda_bit_defa
     module_dict = {}
     for n,m in self.named_modules():
         if (m.__class__.__name__ == "PACT_Act" or \
+            m.__class__.__name__ == "PACT_ActAsymm" or \
             m.__class__.__name__ == "PACT_QuantizedBatchNormNd"):
             module_dict[n] = m
 

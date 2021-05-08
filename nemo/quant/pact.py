@@ -36,7 +36,7 @@ DEFAULT_POOL_REQNT_FACTOR = 32
 DEFAULT_QBATCHNORM_PREC = 12
 QD_REQUANT_DEBUG = False
 
-__all__ = ["PACT_Conv1d", "PACT_Conv2d", "PACT_Linear", "PACT_Act", "PACT_ThresholdAct", "PACT_IntegerAct", "PACT_IntegerAvgPool2d", "PACT_IntegerAvgPool1d","PACT_Identity", "PACT_QuantizedBatchNormNd", "PACT_IntegerBatchNormNd"]
+__all__ = ["QuantPlaceholder", "PACT_Conv1d", "PACT_Conv2d", "PACT_Linear", "PACT_Act", "PACT_ActAsymm", "PACT_ThresholdAct", "PACT_IntegerAct", "PACT_IntegerAvgPool2d", "PACT_IntegerAvgPool1d","PACT_Identity", "PACT_QuantizedBatchNormNd", "PACT_IntegerBatchNormNd"]
 
 # re-quantize from a lower precision (larger eps_in) to a higher precision (lower eps_out)
 # requantization rounding can be excluded for debug purposes, e.g., to identify numerical
@@ -303,6 +303,12 @@ class PACT_QuantFunc_Asymm(torch.autograd.Function):
 
 pact_quantize_asymm = PACT_QuantFunc_Asymm.apply
 
+class QuantPlaceholder(torch.nn.Module):
+    def __init__(self):
+        super(QuantPlaceholder, self).__init__()
+    def forward(x):
+        return x
+
 class PACT_Act(torch.nn.Module):
     r"""PACT (PArametrized Clipping acTivation) activation.
 
@@ -341,7 +347,6 @@ class PACT_Act(torch.nn.Module):
             self.precision = Precision(bits=precision.get_bits())
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.alpha = torch.nn.Parameter(torch.Tensor((alpha,)).to(device), requires_grad=backprop_alpha)
-        self.alpha_p = alpha
         self.statistics_only = statistics_only
         self.deployment = False
         self.eps_in = None
@@ -399,7 +404,7 @@ class PACT_Act(torch.nn.Module):
         if use_max:
             self.alpha.data[0] = self.max.item() * mult
         else:
-            self.alpha.data[0] = torch.sqrt(self.running_var).item() * mult
+            self.alpha.data[0] = self.running_mean + torch.sqrt(self.running_var).item() * mult
 
     def get_statistics(self):
         r"""Returns the statistics collected up to now.
@@ -441,6 +446,144 @@ class PACT_Act(torch.nn.Module):
         else:
             eps = self.alpha/(2.0**(self.precision.get_bits())-1)
             return pact_quantize(x, eps, self.alpha + eps)
+
+class PACT_ActAsymm(torch.nn.Module):
+    r"""PACT (PArametrized Clipping acTivation) activation.
+
+    Implements a :py:class:`torch.nn.Module` to implement PACT-style activations. It is meant to replace :py:class:`torch.nn.ReLU`, :py:class:`torch.nn.ReLU6` and
+    similar activations in a PACT-quantized network.
+
+    This layer can also operate in a special mode, defined by the `statistics_only` member, in which the layer runs in
+    forward-prop without quantization, collecting statistics on the activations that can then be
+    used to reset the value of :math:`\alpha`.
+    In this mode, the layer collects:
+    - tensor-wise maximum value ever seen
+    - running average with momentum 0.9
+    - running variance with momentum 0.9
+
+    """
+
+    def __init__(self, precision=None, alpha=1., beta=1., backprop_alpha=True, statistics_only=False, leaky=None, requantization_factor=DEFAULT_ACT_REQNT_FACTOR):
+        r"""Constructor. Initializes a :py:class:`torch.nn.Parameter` for :math:`\alpha` and sets
+            up the initial value of the `statistics_only` member.
+
+        :param precision: instance defining the current quantization level (default `None`).
+        :type  precision: :py:class:`nemo.precision.Precision`
+        :param alpha: the value of :math:`\alpha`.
+        :type  alpha: `torch.Tensor` or float
+        :param backprop_alpha: default `True`; if `False`, do not update the value of `\alpha` with backpropagation.
+        :type  backprop_alpha: bool
+        :param statistics_only: initialization value of `statistics_only` member.
+        :type  statistics_only: bool
+
+        """
+
+        super(PACT_ActAsymm, self).__init__()
+        if precision is None:
+            self.precision = Precision()
+        else:
+            self.precision = Precision(bits=precision.get_bits())
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.alpha = torch.nn.Parameter(torch.Tensor((alpha,)).to(device), requires_grad=backprop_alpha)
+        self.beta  = torch.nn.Parameter(torch.Tensor((beta, )).to(device), requires_grad=backprop_alpha)
+        self.statistics_only = statistics_only
+        self.deployment = False
+        self.eps_in = None
+        self.leaky = leaky
+        self.requantization_factor = requantization_factor
+
+        # these are only used to gather statistics
+        self.max          = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
+        self.min          = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
+        self.running_mean = torch.nn.Parameter(torch.zeros_like(self.alpha.data).to(device), requires_grad=False)
+        self.running_var  = torch.nn.Parameter(torch.ones_like(self.alpha.data).to(device),  requires_grad=False)
+
+        self.precise = False
+
+    def set_static_precision(self, limit_at_32_bits=True, **kwargs):
+        r"""Sets static parameters used only for deployment.
+
+        """
+        # item() --> conversion to float
+        # apparently causes a slight, but not invisibile, numerical divergence
+        # between FQ and QD stages
+        self.eps_static   = (self.alpha.clone().detach() + self.beta.clone().detach())/(2.0**(self.precision.get_bits())-1)
+        self.alpha_static = self.alpha.clone().detach()
+        self.beta_static  = self.beta.clone().detach()
+        # D is selected as a power-of-two
+        D = 2.0**torch.ceil(torch.log2(self.requantization_factor * self.eps_static / self.eps_in))
+        if not limit_at_32_bits:
+            self.D = D
+        else:
+            self.D = min(D, 2.0**(32-1-(self.precision.get_bits())))
+
+    def get_output_eps(self, eps_in):
+        r"""Get the output quantum (:math:`\varepsilon`) given the input one.
+
+        :param eps_in: input quantum :math:`\varepsilon_{in}`.
+        :type  eps_in: :py:class:`torch.Tensor`
+        :return: output quantum :math:`\varepsilon_{out}`.
+        :rtype:  :py:class:`torch.Tensor`
+
+        """
+
+        return (self.alpha+self.beta)/(2.0**(self.precision.get_bits())-1)
+
+    def reset_alpha(self, use_max=True, mult=1.0, nb_std=None):
+        r"""Reset the value of :math:`\alpha`. If `use_max` is `True`, then the highest tensor-wise value collected
+            in the statistics collection phase is used. If `False`, the collected standard deviation multiplied by
+            `nb_std` is used as a parameter
+
+        :param use_max: if True, use the tensor-wise maximum value collected in the statistics run as new :math:`\alpha`; otherwise, use standard deviation (default True).
+        :type  use_max: bool
+        :param mult: multiplier for maximum or standard deviation to be used to initialize :math:`\alpha`.
+        :type  mult: float
+
+        """
+
+        if use_max:
+            self.alpha.data[0] = -self.min.item() * mult
+            self.beta.data[0]  =  self.max.item() * mult
+        else:
+            self.alpha.data[0] = self.running_mean - torch.sqrt(self.running_var).item() * mult
+            self.beta.data[0]  = self.running_mean + torch.sqrt(self.running_var).item() * mult
+
+    def get_statistics(self):
+        r"""Returns the statistics collected up to now.
+    
+        :return: The collected statistics (maximum, running average, running variance).
+        :rtype:  tuple of floats
+
+        """
+        return self.min.item(), self.max.item(), self.running_mean.item(), self.running_var.item()
+    
+    def forward(self, x):
+        r"""Forward-prop function for PACT-quantized activations.
+        
+        See :py:class:`nemo.quant.pact_quant.PACT_QuantFunc` for details on the normal operation performed by this layer.
+        In statistics mode, it uses a normal ReLU and collects statistics in the background.
+
+        :param x: input activations tensor.
+        :type  x: :py:class:`torch.Tensor`
+        
+        :return: output activations tensor.
+        :rtype:  :py:class:`torch.Tensor`
+
+        """
+
+        if self.deployment:
+            x_rq = pact_quantized_requantize(x, self.eps_in, self.eps_static, self.D, exclude_requant_rounding=self.precise) * self.eps_static
+            return x_rq.clamp(0, self.alpha_static.data[0])
+        elif self.statistics_only:
+            with torch.no_grad():
+                self.max[:] = max(self.max.item(), x.max())
+                self.min[:] = min(self.min.item(), x.min())
+                self.running_mean[:] = 0.9 * self.running_mean.item() + 0.1 * x.mean()
+                self.running_var[:]  = 0.9 * self.running_var.item()  + 0.1 * x.std()*x.std()
+            return x
+        else:
+            eps = (self.alpha+self.beta)/(2.0**(self.precision.get_bits())-1)
+            return pact_quantize_asymm(x, eps, self.alpha, self.beta + eps)
 
 class PACT_IntegerAdd(torch.nn.Module):
     r"""PACT (PArametrized Clipping acTivation) activation for integer images.

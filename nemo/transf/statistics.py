@@ -62,7 +62,8 @@ def _set_statistics_act_pact(self):
     """
 
     for n,m in self.named_modules():
-        if m.__class__.__name__ == "PACT_Act":
+        if m.__class__.__name__ == "PACT_Act" or \
+           m.__class__.__name__ == "PACT_ActAsymm":
             m.statistics_only = True
 
 def _get_statistics_act_pact(self):
@@ -73,7 +74,8 @@ def _get_statistics_act_pact(self):
     d = OrderedDict([])
     for n,m in self.named_modules():
         d[n] = OrderedDict([])
-        if m.__class__.__name__ == "PACT_Act":
+        if m.__class__.__name__ == "PACT_Act" or \
+           m.__class__.__name__ == "PACT_ActAsymm":
             d[n]['max']          = m.get_statistics()[0]
             d[n]['running_mean'] = m.get_statistics()[1]
             d[n]['running_var']  = m.get_statistics()[2]
@@ -86,7 +88,8 @@ def _unset_statistics_act_pact(self):
     """
 
     for n,m in self.named_modules():
-        if m.__class__.__name__ == "PACT_Act":
+        if m.__class__.__name__ == "PACT_Act" or \
+           m.__class__.__name__ == "PACT_ActAsymm":
             m.statistics_only = False
 
 def _set_statistics_bn_pact(self):

@@ -133,6 +133,7 @@ def quantize_pact(module, W_bits=4, x_bits=4, dummy_input=None, remove_dropout=F
     module.equalize_weights_dfq        = types.MethodType(nemo.transf.equalize._equalize_weights_dfq_pact, module)
     module.equalize_weights_lsq        = types.MethodType(nemo.transf.equalize._equalize_weights_lsq_pact, module)
     module.equalize_weights_unfolding  = types.MethodType(nemo.transf.equalize._equalize_weights_unfolding_pact, module)
+    module.equalize_asymm_act          = types.MethodType(nemo.transf.equalize._equalize_asymm_act, module)
     module.statistics_act              = types.MethodType(nemo.transf.statistics._statistics_act_pact, module)
     module.set_statistics_act          = types.MethodType(nemo.transf.statistics._set_statistics_act_pact, module)
     module.get_statistics_act          = types.MethodType(nemo.transf.statistics._get_statistics_act_pact, module)
@@ -208,6 +209,9 @@ def _hier_integerizer(module, **kwargs):
     elif (module.__class__.__name__ == "PACT_QuantizedBatchNormNd"):
         module = PACT_IntegerBatchNormNd(kappa=module.kappa, lamda=module.lamda, eps_in=module.eps_in, eps_kappa=module.eps_kappa, eps_lamda=module.eps_lamda)
         module.integerize_weights(**kwargs)
+    elif (module.__class__.__name__ == "PACT_ActAsymm"):
+        module = PACT_IntegerAct(precision=module.precision, eps_in=module.eps_in, eps_out=module.eps_static, alpha=module.beta_static, **kwargs)
+        module.set_output_eps(**kwargs)
     elif (module.__class__.__name__ == "PACT_Act"):
         module = PACT_IntegerAct(precision=module.precision, eps_in=module.eps_in, eps_out=module.eps_static, alpha=module.alpha_static, **kwargs)
         module.set_output_eps(**kwargs)
@@ -297,6 +301,12 @@ def _hier_quantizer_pact(module, graph=None, **kwargs):
         return module
     elif module.__class__.__name__ == 'LeakyReLU':
         module = PACT_Act(leaky=module.negative_slope, **kwargs)
+        return module
+    elif module.__class__.__name__ == 'QuantPlaceholder':
+        module = PACT_ActAsymm(**kwargs)
+        return module
+    elif module.__class__.__name__ == 'Identity':
+        module = PACT_ActAsymm(**kwargs)
         return module
     else:
         for n,m in module.named_children():

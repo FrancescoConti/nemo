@@ -64,6 +64,7 @@ def _equalize_weights_dfq_pact(self, equalize_dict={}, act_dict={}, verbose=Fals
             m.__class__.__name__ == "PACT_Linear" or \
             m.__class__.__name__ == "BatchNorm2d" or \
             m.__class__.__name__ == "BatchNorm1d" or \
+            m.__class__.__name__ == "PACT_ActAsymm" or \
             m.__class__.__name__ == "PACT_Act"):
             module_dict[n] = m
     it = 0
@@ -205,4 +206,65 @@ def _equalize_weights_lsq_pact(self, bn_dict={}, verbose=False, eps=None):
         m_after.weight.data[:] = m_after.weight.data[:] * reshape_after(m_after, coeff)
         if verbose:
             logging.info("[Equalization by Least Squares] %s: wrange_min=%.5f wrange_max=%.5f" % (n_before, weight_range(m_before, 0).min().item(), weight_range(m_before, 0).max().item()))
+
+def _equalize_asymm_act(self, act_dict={}, eq_dict={}, apply_before=True, apply_after=True, apply_act=True, residual_effect=False, pooling_factor=1.0, verbose=False):
+
+    if not eq_dict:
+        print("[Asymmetric Activations Equalization] Need to explicitly define an equalization dictionary (LIN -> LIN)")
+        return
+    if not act_dict:
+        print("[Asymmetric Activations Equalization] Need to explicitly define an activation dictionary (LIN -> ACT)")
+        return
+ 
+    module_dict = {}
+    for n,m in self.named_modules():
+        if (m.__class__.__name__ == "PACT_Conv2d" or \
+            m.__class__.__name__ == "PACT_Conv1d" or \
+            m.__class__.__name__ == "PACT_Linear" or \
+            m.__class__.__name__ == "BatchNorm2d" or \
+            m.__class__.__name__ == "BatchNorm1d" or \
+            m.__class__.__name__ == "PACT_ActAsymm" ):
+            module_dict[n] = m
+    
+    for n_before in eq_dict.keys():
+        flag = False
+        n_after = eq_dict[n_before]
+        n_act = act_dict[n_before]
+        try:
+            m_act = module_dict[n_act]
+        except KeyError:
+            flag = True
+        if flag:
+            # this is a normal PACT_Act, not a PACT_ActAsymm
+            continue
+        m_before = module_dict[n_before]
+        m_after = module_dict[n_after]
+        offset = m_act.alpha.item()
+        if m_before.bias is None:
+            m_before.bias = torch.nn.Parameter(torch.zeros(m_before.weight.shape[0], device=m_before.weight.device))
+        if m_after.bias is None:
+            m_after.bias = torch.nn.Parameter(torch.zeros(m_after.weight.shape[0], device=m_after.weight.device))
+        if apply_before:
+            m_before.bias.data[:] += offset
+        if not residual_effect:
+            try:
+                if m_after.__class__.__name__ == "PACT_Conv2d":
+                    offset_after = (offset*m_after.weight.data[:]).sum(3).sum(2).sum(1) # FIXME Check Conv1d and Linear...
+                elif m_after.__class__.__name__ == "PACT_Conv1d":
+                    offset_after = (offset*m_after.weight.data[:]).sum(2).sum(1) # FIXME Check Conv1d and Linear...
+                elif m_after.__class__.__name__ == "PACT_Linear":
+                    offset_after = (offset*m_after.weight.data[:]).sum(1) # FIXME Check Conv1d and Linear...
+                else:
+                    offset_after = offset
+            except IndexError:
+                import IPython; IPython.embed()
+        else:
+            offset_after = offset
+        if apply_after:
+            m_after.bias.data[:] -= offset_after * pooling_factor
+        if apply_act:
+            m_act.beta.data  [:] += offset
+            m_act.alpha.data [:] = 0
+
+
 
