@@ -306,7 +306,7 @@ pact_quantize_asymm = PACT_QuantFunc_Asymm.apply
 class QuantPlaceholder(torch.nn.Module):
     def __init__(self):
         super(QuantPlaceholder, self).__init__()
-    def forward(x):
+    def forward(x, **kwargs):
         return x
 
 class PACT_Act(torch.nn.Module):
